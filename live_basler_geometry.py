@@ -11,8 +11,9 @@ from pypylon import pylon
 # ============================================================
 
 MODEL_PATH = (
-    r"C:\Users\diez0001\Documents\ABB_Vision_Training"
-    r"\runs\detect\ina700_3class_basler_v3\weights\best.pt"
+    r"H:\ABB_Vision_Project"
+    r"\runs\detect\ina700_3class_basler_v3"
+    r"\weights\best.pt"
 )
 
 CONFIDENCE = 0.25
@@ -299,7 +300,163 @@ class GeometryAnalyzer:
 
         return angle
 
+    # --------------------------------------------------------
+    # CIRCLE GEOMETRY FEATURES
+    # --------------------------------------------------------
 
+        # --------------------------------------------------------
+    # CIRCLE / POLYGON GEOMETRY FEATURES
+    # --------------------------------------------------------
+
+    def circle_features(self, contour):
+
+        area = cv2.contourArea(contour)
+
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if area <= 0 or perimeter <= 0:
+            return None
+
+        # ----------------------------------------------------
+        # 1. CIRCULARITY
+        # Perfect mathematical circle = 1.0
+        # ----------------------------------------------------
+
+        circularity = (
+            4.0 *
+            math.pi *
+            area /
+            (perimeter * perimeter)
+        )
+
+        # ----------------------------------------------------
+        # 2. MULTI-EPSILON POLYGON APPROXIMATION
+        #
+        # A true polygon should tend to preserve its number
+        # of corners across several approximation strengths.
+        # ----------------------------------------------------
+
+        epsilon_values = [
+            0.010,
+            0.015,
+            0.020,
+            0.025,
+            0.030
+        ]
+
+        corner_counts = []
+
+        for epsilon in epsilon_values:
+
+            approx = cv2.approxPolyDP(
+                contour,
+                epsilon * perimeter,
+                True
+            )
+
+            corner_counts.append(
+                len(approx)
+            )
+
+        # ----------------------------------------------------
+        # 3. RADIUS CONSISTENCY
+        # ----------------------------------------------------
+
+        moments = cv2.moments(contour)
+
+        if abs(moments["m00"]) < 1e-6:
+            return None
+
+        cx = (
+            moments["m10"] /
+            moments["m00"]
+        )
+
+        cy = (
+            moments["m01"] /
+            moments["m00"]
+        )
+
+        points = (
+            contour
+            .reshape(-1, 2)
+            .astype(np.float32)
+        )
+
+        radii = np.sqrt(
+            (points[:, 0] - cx) ** 2 +
+            (points[:, 1] - cy) ** 2
+        )
+
+        mean_radius = float(
+            np.mean(radii)
+        )
+
+        if mean_radius <= 1e-6:
+            return None
+
+        radius_cv = (
+            float(np.std(radii)) /
+            mean_radius
+        )
+
+        # ----------------------------------------------------
+        # 4. CORNER STABILITY
+        #
+        # Example:
+        # [8, 8, 8, 8, 8] = very stable polygon structure
+        # ----------------------------------------------------
+
+        unique_counts = len(
+            set(corner_counts)
+        )
+
+        return {
+            "circularity": circularity,
+            "corner_counts": corner_counts,
+            "corner_stability": unique_counts,
+            "radius_cv": radius_cv
+        }
+
+    
+    def validate_circle_geometry(self, features):
+
+        if features is None:
+            return True, "no geometry data"
+
+        circularity = features["circularity"]
+        corners = features["corner_counts"]
+        radius_cv = features["radius_cv"]
+
+        # --------------------------------------------------------
+        # STRONG POLYGON EVIDENCE
+        #
+        # Blue octagon repeatedly produced:
+        # [7, 6, 6, 6, 6]
+        #
+        # Real red circle repeatedly produced:
+        # [14-16, 8, 8, 8, 8]
+        #
+        # We deliberately keep this conservative.
+        # --------------------------------------------------------
+
+        later_counts = corners[1:]
+
+        stable_low_polygon = (
+            len(later_counts) >= 3
+            and max(later_counts) <= 7
+            and radius_cv > 0.035
+            and circularity > 0.70
+        )
+
+        if stable_low_polygon:
+            return False, "polygon geometry"
+
+        return True, "accepted"
+        
     # --------------------------------------------------------
     # COMPLETE ANALYSIS
     # --------------------------------------------------------
@@ -327,6 +484,9 @@ class GeometryAnalyzer:
             return None
 
         angle = None
+        circle_features = None
+        circle_valid = True
+        circle_reason = "not a circle"
 
         if class_name == "triangle":
 
@@ -350,11 +510,19 @@ class GeometryAnalyzer:
             # Uniform circle has no meaningful
             # rotational orientation.
             angle = None
+            circle_features = self.circle_features(contour)
+
+            circle_valid, circle_reason = (
+                self.validate_circle_geometry(circle_features)
+            )
 
         return {
             "contour": contour,
             "center": center,
             "angle": angle,
+            "circle_features": circle_features,
+            "circle_valid": circle_valid,
+            "circle_reason": circle_reason
         }
 
 
@@ -557,6 +725,19 @@ try:
                 "angle"
             ]
 
+            circle_features = analysis[
+                "circle_features"
+            ]
+
+            circle_valid = analysis[
+                "circle_valid"
+            ]
+
+            circle_reason = analysis[
+                "circle_reason"
+            ]
+
+
 
             # ------------------------------------------------
             # DRAW CONTOUR
@@ -650,6 +831,41 @@ try:
                 f"{angle_text}"
             )
 
+            if (
+                class_name == "circle"
+                and not circle_valid
+            ):
+
+                print(
+                    f"REJECTED circle candidate | "
+                    f"reason={circle_reason} | "
+                    f"conf={confidence:.2f}"
+                )
+
+                if circle_features is not None:
+                    print(
+                        "    GEOMETRY | "
+                        f"circ={circle_features['circularity']:.3f} | "
+                        f"corners={circle_features['corner_counts']} | "
+                        f"radius_cv={circle_features['radius_cv']:.4f}"
+                    )
+
+                cv2.putText(
+                    display,
+                    "REJECTED: POLYGON",
+                    (
+                        int(x1),
+                        max(30, int(y1) - 10)
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+
+                continue
+
 
             cv2.putText(
                 display,
@@ -680,6 +896,19 @@ try:
                 f"angle="
                 f"{'N/A' if angle is None else f'{angle:.1f}'}"
             )
+
+            if(class_name == "circle" and circle_features is not None):
+                print(
+                    "    CIRCLE CHECK | "
+                    f"circ="
+                    f"{circle_features['circularity']:.3f} | "
+                    f"corners="
+                    f"{circle_features['corner_counts']} | "
+                    f"stability="
+                    f"{circle_features['corner_stability']} | "
+                    f"radius_cv="
+                    f"{circle_features['radius_cv']:.4f}"
+                )
 
 
         # ----------------------------------------------------
